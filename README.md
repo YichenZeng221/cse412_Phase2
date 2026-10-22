@@ -13,7 +13,7 @@ cd cse412_Phase2
 
 Run all commands from this folder.
 
-You need PostgreSQL 15 or later, `psql`, and `python3`. No pip packages are needed. These commands use a macOS/Linux terminal. Tested on macOS with PostgreSQL 15.19.
+You need PostgreSQL 15 or later, `psql`, and `python3` (3.9 or later). No pip packages are needed. These commands use a macOS/Linux terminal. Tested on macOS with PostgreSQL 15.19.
 
 Check your tools and connection:
 
@@ -32,13 +32,9 @@ export PGPORT=5432
 export PGUSER=your_postgres_username
 ```
 
-Download the original dataset if `data/Two-Stage_Dataset.zip` is missing:
+Put the course archive (`CSE_412_Semiconductor_Fabrication_Factory-<timestamp>-001.zip`, from the course materials) in `data/`. Any file name starting with `CSE_412_Semiconductor_Fabrication_Factory` works; to use a different path, set `TWOSTAGE_ARCHIVE=/path/to/archive.zip`.
 
-```bash
-curl -fL "https://downloads.sourceforge.net/project/devs-suitesim/Dataset/MiniFab%20Cascade%20Two-Stage%20Factory/Two-Stage%20Dataset.zip" -o data/Two-Stage_Dataset.zip
-```
-
-Keep the ZIP unchanged. The importer reads it directly and checks its checksum.
+Keep the ZIP unchanged. The importer reads it directly and checks a SHA-256 of the dataset CSVs inside it (the other files in the archive are ignored). It will stop with a checksum error if the data differs.
 
 Create the database, tables, and data **once**:
 
@@ -221,7 +217,7 @@ Exit with `\q`. If an input goes wrong, press **Control+C**, run `ROLLBACK;`, th
 
 ## Sharing on GitHub
 
-This public repository contains the code and Team 19's proposal and ER diagram. The original dataset and reports containing its results are excluded by `.gitignore`. Each teammate downloads the dataset from the official link above.
+This public repository contains the code and Team 19's proposal and ER diagram. The original dataset and reports containing its results are excluded by `.gitignore`. Each teammate adds the course archive to `data/` as described in Setup; make sure `.gitignore` excludes it.
 
 The dataset is provided for course/research use and has redistribution restrictions. See the [official dataset folder and data policy](https://sourceforge.net/projects/devs-suitesim/files/Dataset/MiniFab%20Cascade%20Two-Stage%20Factory/).
 
