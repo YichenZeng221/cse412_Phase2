@@ -1,199 +1,172 @@
 #!/usr/bin/env python3
-r"""Export dataset CSVs for PostgreSQL COPY."""
+"""Export dataset CSVs for PostgreSQL COPY."""
+
+from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
-import io
 import json
 import sys
 from collections import Counter
-from decimal import Decimal, InvalidOperation
-from pathlib import Path, PurePosixPath
-from zipfile import ZipFile
+from collections.abc import Callable, Iterable, Iterator
+from itertools import compress
 
-ARCHIVE = Path(__file__).with_name('Two-Stage_Dataset.zip')
-SOURCE_SHA256 = '05e240495b967558fdbfea152019bd0c569450b82562c60e5f7f4304f9a979cc'
-MACHINES = {'a1', 'a2', 'b1', 'b2', 'c1', 'c2', 'd1', 'd2', 'e1', 'e2', 'f1', 'g1'}
-SEGMENTS = {'ab1', 'ab2', 'cd1', 'cd2', 'ee1', 'ee2'}
-TRANSDUCERS = {'tr', 'trd1', 'trd2', 'tri1', 'tri2', 'trl1', 'trl2'}
-TABLES = ('experiment', 'component', 'stage', 'machine', 'segment', 'transducer',
-          'trajectory', 'observation')
+from twostage import (MACHINES, SEGMENTS, DATASET_SHA256, TRANSDUCERS, Dataset,
+                      classify, column_type, open_dataset)
 
+# Reported by the audit only; these files are absent from the original archive.
+KNOWN_MISSING_FILES = ['12-18-6-1541/trd1.csv', '6-6-0-508/ee2.csv']
 
-def numeric(value):
-    try:
-        return Decimal(value)
-    except InvalidOperation:
-        return None
+Exporter = Callable[[Dataset], Iterable[tuple]]
+EXPORTERS: dict[str, Exporter] = {}
 
 
-def cell_kind(value):
-    if numeric(value) is not None:
-        return 'numeric'
-    if value.startswith('{') and value.endswith('}'):
-        return 'message'
-    return 'categorical'
+def exporter(table: str) -> Callable[[Exporter], Exporter]:
+    def register(func: Exporter) -> Exporter:
+        EXPORTERS[table] = func
+        return func
+    return register
 
 
-def source_rows(archive, member, header):
-    with archive.open(member) as stream:
-        reader = csv.reader(io.TextIOWrapper(stream, encoding='utf-8-sig', newline=''))
-        next(reader)
-        for row_number, row in enumerate(reader, 2):
-            # Each export ends with a timestamp and no values.
-            if len(row) == 1:
-                row += [''] * (len(header) - 1)
-            if len(row) != len(header):
-                raise ValueError(f'{member}:{row_number}: unexpected CSV width {len(row)}')
-            time = row[0].strip() or None
-            if time is not None:
-                number = numeric(time)
-                if number is None or not number.is_finite() or number < 0:
-                    raise ValueError(f'{member}:{row_number}: invalid logical time')
-            elif row_number != 2:
-                raise ValueError(f'{member}:{row_number}: unexpected missing logical time')
-            yield time, [v.strip() for v in row[1:]]
+@exporter('experiment')
+def experiment_rows(ds: Dataset) -> Iterator[tuple]:
+    yield ('experiment_id', 'experiment_code', 'pa_count', 'pb_count', 'tw_count',
+           'simulation_steps')
+    for code in ds.codes:
+        pa, pb, tw, _undocumented_label = map(int, code.split('-'))
+        # simulation_steps stays NULL because the fourth folder token is undocumented.
+        yield ds.exp_ids[code], code, pa, pb, tw, None
 
 
-def inventory(archive):
-    files = [n for n in archive.namelist()
-             if n.startswith('Two-Stage Dataset/') and n.endswith('.csv')]
-    if len(files) != len(set(files)):
-        raise ValueError('Duplicate archive members')
-    codes = sorted({PurePosixPath(n).parent.name for n in files},
-                   key=lambda c: tuple(map(int, c.split('-'))))
-    components = sorted({PurePosixPath(n).stem for n in files})
-    exp_ids = {code: i for i, code in enumerate(codes, 1)}
-    comp_ids = {name: i for i, name in enumerate(components, 1)}
-    files.sort(key=lambda n: (exp_ids[PurePosixPath(n).parent.name], PurePosixPath(n).stem))
-    catalog = []
-    trajectory_id = 0
-    for member in files:
-        with archive.open(member) as stream:
-            header = next(csv.reader(io.TextIOWrapper(stream, encoding='utf-8-sig')))
-        if header[0] != '' or len(set(header)) != len(header) or any(not h for h in header[1:]):
-            raise ValueError(f'Invalid or duplicate header: {member}')
-        ids = list(range(trajectory_id + 1, trajectory_id + len(header)))
-        trajectory_id += len(header) - 1
-        catalog.append((member, header, ids))
-    if len(codes) != 18 or len(files) != 451 or len(components) != 28:
-        raise ValueError('Archive inventory differs from the reviewed original')
-    return codes, exp_ids, comp_ids, catalog
+@exporter('component')
+def component_rows(ds: Dataset) -> Iterator[tuple]:
+    yield ('component_id', 'component_name')
+    yield from ((i, name) for name, i in ds.comp_ids.items())
 
 
-def export(table, archive, codes, exp_ids, comp_ids, catalog):
-    out = csv.writer(sys.stdout, lineterminator='\n')
-    if table == 'experiment':
-        out.writerow(('experiment_id', 'experiment_code', 'pa_count', 'pb_count', 'tw_count', 'simulation_steps'))
-        for code in codes:
-            pa, pb, tw, _undocumented_label = map(int, code.split('-'))
-            # Leave simulation_steps NULL because the fourth folder token is undocumented.
-            out.writerow((exp_ids[code], code, pa, pb, tw, None))
-    elif table == 'component':
-        out.writerow(('component_id', 'component_name'))
-        out.writerows((i, name) for name, i in comp_ids.items())
-    elif table == 'stage':
-        out.writerow(('stage_id', 'stage_number', 'component_id'))
-        # No stage-root component is listed, so the optional FK stays NULL.
-        out.writerows(((1, 1, None), (2, 2, None)))
-    elif table in ('machine', 'segment', 'transducer'):
-        out.writerow(('component_id',))
-        names = {'machine': MACHINES, 'segment': SEGMENTS, 'transducer': TRANSDUCERS}[table]
-        out.writerows((comp_ids[name],) for name in sorted(names))
-    elif table == 'trajectory':
-        out.writerow(('trajectory_id', 'experiment_id', 'component_id', 'trajectory_type', 'variable_name'))
-        for member, header, ids in catalog:
-            kinds = [set() for _ in ids]
-            for _time, values in source_rows(archive, member, header):
-                for index, value in enumerate(values):
-                    if value:
-                        kinds[index].add(cell_kind(value))
-            for tid, variable, observed in zip(ids, header[1:], kinds):
-                kind = next(iter(observed)) if len(observed) == 1 else ('mixed' if observed else 'empty')
-                out.writerow((tid, exp_ids[PurePosixPath(member).parent.name],
-                              comp_ids[PurePosixPath(member).stem], kind, variable))
-    elif table == 'observation':
-        out.writerow(('observation_id', 'trajectory_id', 'logical_time', 'value'))
-        oid = 0
-        for member, header, ids in catalog:
-            for time, values in source_rows(archive, member, header):
-                for tid, value in zip(ids, values):
-                    if value:
-                        oid += 1
-                        out.writerow((oid, tid, time, value))
+@exporter('stage')
+def stage_rows(ds: Dataset) -> Iterator[tuple]:
+    yield ('stage_id', 'stage_number', 'component_id')
+    # No stage-root component is listed, so the optional FK stays NULL.
+    yield 1, 1, None
+    yield 2, 2, None
 
 
-def audit(archive, codes, exp_ids, comp_ids, catalog):
-    counts = Counter()
-    types = Counter()
-    experiments = {code: {'experiment_id': exp_ids[code], 'csv_files': 0,
-                          'raw_rows': 0, 'observations': 0} for code in codes}
-    for member, header, ids in catalog:
-        code = PurePosixPath(member).parent.name
-        item = experiments[code]
-        item['csv_files'] += 1
-        kinds = [set() for _ in ids]
-        seen = [set() for _ in ids]
-        counts['trajectories'] += len(ids)
-        for time, values in source_rows(archive, member, header):
+def subtype_exporter(names: frozenset[str]) -> Exporter:
+    def rows(ds: Dataset) -> Iterator[tuple]:
+        yield ('component_id',)
+        yield from ((ds.comp_ids[name],) for name in sorted(names))
+    return rows
+
+
+EXPORTERS.update(machine=subtype_exporter(MACHINES),
+                 segment=subtype_exporter(SEGMENTS),
+                 transducer=subtype_exporter(TRANSDUCERS))
+
+
+@exporter('trajectory')
+def trajectory_rows(ds: Dataset) -> Iterator[tuple]:
+    yield ('trajectory_id', 'experiment_id', 'component_id', 'trajectory_type',
+           'variable_name')
+    for member in ds.members:
+        exp_id = ds.exp_ids[member.code]
+        comp_id = ds.comp_ids[member.component]
+        for tid, kind, variable in zip(member.trajectory_ids, ds.column_types(member),
+                                       member.variables):
+            yield tid, exp_id, comp_id, kind, variable
+
+
+@exporter('observation')
+def observation_rows(ds: Dataset) -> Iterator[tuple]:
+    yield ('observation_id', 'trajectory_id', 'logical_time', 'value')
+    yield from ds.observations()
+
+
+def audit(ds: Dataset) -> dict:
+    totals: Counter[str] = Counter()
+    types: Counter[str] = Counter()
+    experiments = {code: {'experiment_id': ds.exp_ids[code], 'csv_files': 0,
+                          'raw_rows': 0, 'observations': 0} for code in ds.codes}
+
+    for member in ds.members:
+        width = len(member.variables)
+        counts: Counter[str] = Counter()
+        observed = [set() for _ in range(width)]
+        seen = [set() for _ in range(width)]
+
+        for time, values in ds.rows(member):
+            empty = values.count('')
+            filled = width - empty
             counts['raw_rows'] += 1
-            item['raw_rows'] += 1
+            counts['rectangular_value_slots'] += width
             if time is None:
                 counts['raw_rows_without_time'] += 1
-            if not any(values):
+            if not filled:
                 counts['rows_without_values'] += 1
-            for index, value in enumerate(values):
-                counts['rectangular_value_slots'] += 1
-                if not value:
-                    counts['empty_value_slots_omitted'] += 1
-                    continue
-                counts['observations'] += 1
-                item['observations'] += 1
+            if empty:
+                counts['empty_value_slots_omitted'] += empty
+            if filled:
+                counts['observations'] += filled
                 if time is None:
-                    counts['observations_without_time'] += 1
+                    counts['observations_without_time'] += filled
+            for index, value in compress(enumerate(values), values):
                 key = time, value
                 if key in seen[index]:
                     counts['repeated_trajectory_time_value_retained'] += 1
-                seen[index].add(key)
-                kinds[index].add(cell_kind(value))
-                dec = numeric(value)
-                if dec is not None and not dec.is_finite():
+                else:
+                    seen[index].add(key)
+                kind, nonfinite = classify(value)
+                observed[index].add(kind)
+                if nonfinite:
                     counts['nonfinite_value_tokens_retained'] += 1
-        for observed in kinds:
-            types[next(iter(observed)) if len(observed) == 1 else ('mixed' if observed else 'empty')] += 1
-    result = {
-        'archive_sha256': SOURCE_SHA256,
-        'csv_files': len(catalog), 'experiments': experiments,
-        'table_counts': {'experiment': len(codes), 'component': len(comp_ids), 'stage': 2,
-                         'machine': len(MACHINES), 'segment': len(SEGMENTS),
-                         'transducer': len(TRANSDUCERS), 'trajectory': counts['trajectories'],
-                         'observation': counts['observations']},
-        'source_profile': dict(counts), 'trajectory_types': dict(types),
-        'unclassified_base_components': sorted(set(comp_ids) - MACHINES - SEGMENTS - TRANSDUCERS),
-        'missing_source_files': ['12-18-6-1541/trd1.csv', '6-6-0-508/ee2.csv'],
+
+        totals['trajectories'] += width
+        totals.update(counts)
+        types.update(map(column_type, observed))
+        item = experiments[member.code]
+        item['csv_files'] += 1
+        item['raw_rows'] += counts['raw_rows']
+        item['observations'] += counts['observations']
+
+    return {
+        'dataset_sha256': DATASET_SHA256,
+        'csv_files': len(ds.members),
+        'experiments': experiments,
+        'table_counts': {'experiment': len(ds.codes), 'component': len(ds.comp_ids),
+                         'stage': 2, 'machine': len(MACHINES), 'segment': len(SEGMENTS),
+                         'transducer': len(TRANSDUCERS),
+                         'trajectory': totals['trajectories'],
+                         'observation': totals['observations']},
+        'source_profile': dict(totals),
+        'trajectory_types': dict(types),
+        'unclassified_base_components':
+            sorted(ds.comp_ids.keys() - MACHINES - SEGMENTS - TRANSDUCERS),
+        'missing_source_files': KNOWN_MISSING_FILES,
         'normalization': 'Trim outer cell whitespace; omit empty value cells; preserve blank initial time as NULL; retain repeated events; no interpolation or fabricated values.',
         'simulation_steps': 'NULL: fourth experiment-folder token has no documented definition.',
-        'stage_component_id': 'NULL: no single stage-root component is identified; literal optional ER mapping retained.'
+        'stage_component_id': 'NULL: no single stage-root component is identified; literal optional ER mapping retained.',
     }
-    json.dump(result, sys.stdout, indent=2)
-    sys.stdout.write('\n')
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('table', choices=(*TABLES, 'audit'))
-    args = parser.parse_args()
-    digest = hashlib.sha256(ARCHIVE.read_bytes()).hexdigest()
-    if digest != SOURCE_SHA256:
-        raise ValueError(f'Original archive checksum mismatch: {digest}')
-    with ZipFile(ARCHIVE) as archive:
-        args_tuple = (archive, *inventory(archive))
-        if args.table == 'audit':
-            audit(*args_tuple)
-        else:
-            export(args.table, *args_tuple)
+    parser.add_argument('table', choices=(*EXPORTERS, 'audit'))
+    args = parser.parse_args(argv)
+    # Pin the byte stream psql \copy reads, whatever the locale says.
+    sys.stdout.reconfigure(encoding='utf-8', newline='')
+    try:
+        with open_dataset() as ds:
+            if args.table == 'audit':
+                json.dump(audit(ds), sys.stdout, indent=2)
+                sys.stdout.write('\n')
+            else:
+                csv.writer(sys.stdout, lineterminator='\n').writerows(
+                    EXPORTERS[args.table](ds))
+    except (OSError, ValueError, csv.Error) as error:
+        print(f'{args.table}: {error}', file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

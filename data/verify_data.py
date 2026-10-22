@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check PostgreSQL values and IDs against the original CSV archive."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import hashlib
@@ -8,177 +10,161 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from zipfile import ZipFile
+from functools import lru_cache
+from itertools import zip_longest
+
+from twostage import DATASET_SHA256, Dataset, Observation, open_dataset
+
+_encode = json.JSONEncoder(separators=(',', ':')).encode
+
+CATALOG_QUERY = '''SELECT e.experiment_id, e.experiment_code, c.component_name,
+                          t.variable_name, t.trajectory_id
+                   FROM public.trajectory t
+                   JOIN public.experiment e USING (experiment_id)
+                   JOIN public.component c USING (component_id)'''
+OBSERVATION_QUERY = '''SELECT observation_id, trajectory_id, logical_time, value
+                       FROM public.observation ORDER BY observation_id'''
+
+Key = tuple[str, str, str]  # (experiment_code, component_name, variable_name)
 
 
-ARCHIVE = Path(__file__).with_name('Two-Stage_Dataset.zip')
-ORIGINAL_SHA256 = '05e240495b967558fdbfea152019bd0c569450b82562c60e5f7f4304f9a979cc'
-
-
-def canonical_time(value):
+@lru_cache(maxsize=4096)  # consecutive observations of a row share one time
+def canonical_time(value: str | None) -> str | None:
     """Normalize decimal scale for the source/database comparison."""
-    if value is None or value == '':
+    if not value:
         return None
     number = Decimal(value)
     if not number.is_finite() or number < 0:
         raise ValueError(f'Invalid logical time: {value!r}')
+    if number == 0:
+        return '0'
     fixed = format(number, 'f')
-    if '.' in fixed:
-        fixed = fixed.rstrip('0').rstrip('.')
-    return '0' if number == 0 else fixed
+    return fixed.rstrip('0').rstrip('.') if '.' in fixed else fixed
 
 
-def digest_record(digest, observation_id, trajectory_id, time, value):
-    record = [observation_id, trajectory_id, canonical_time(time), value]
-    digest.update(json.dumps(record, separators=(',', ':')).encode('utf-8'))
-    digest.update(b'\n')
+def canonical(records: Iterable[Observation]) -> Iterator[Observation]:
+    for oid, tid, time, value in records:
+        yield oid, tid, canonical_time(time), value
 
 
-def database_rows(database, query):
-    """Read PostgreSQL COPY output as CSV rows."""
-    command = [
-        'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '--dbname', database,
-        '--command', f'COPY ({query}) TO STDOUT WITH (FORMAT CSV)',
-    ]
-    with subprocess.Popen(command, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, text=True,
-                          encoding='utf-8') as process:
+@dataclass
+class StreamSummary:
+    count: int = 0
+    blank_time: int = 0
+    sha256: str = ''
+
+
+def summarize(records: Iterable[Observation]) -> StreamSummary:
+    """Fingerprint a canonical observation stream."""
+    digest = hashlib.sha256()
+    summary = StreamSummary()
+    for record in records:
+        summary.count += 1
+        summary.blank_time += record[2] is None
+        digest.update(f'{_encode(record)}\n'.encode())
+    summary.sha256 = digest.hexdigest()
+    return summary
+
+
+def first_difference(source: Iterable[Observation], database: Iterable[Observation]) -> str:
+    for n, (src, db) in enumerate(zip_longest(source, database), 1):
+        if src != db:
+            return f'first difference at record {n}: source={src!r} database={db!r}'
+    return 'no record-level difference found'
+
+
+def copy_rows(database: str, query: str) -> Iterator[list[str]]:
+    """Stream a query's result from psql as CSV rows."""
+    command = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '--dbname', database,
+               '--command', f'COPY ({query}) TO STDOUT WITH (FORMAT CSV)']
+    # stderr goes to a file, not a pipe: an undrained pipe can deadlock psql.
+    with tempfile.TemporaryFile() as stderr, \
+            subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr) as process:
         try:
-            yield from csv.reader(process.stdout)
+            # newline='' keeps embedded \r and \r\n intact, matching the source CSV.
+            with io.TextIOWrapper(process.stdout, encoding='utf-8', newline='') as text:
+                yield from csv.reader(text)
         except BaseException:
             process.terminate()
             raise
-        finally:
-            process.stdout.close()
-        error = process.stderr.read()
-        code = process.wait()
-        if code != 0:
-            raise RuntimeError(f'psql exited {code}: {error.strip()}')
+        if code := process.wait():
+            stderr.seek(0)
+            message = stderr.read().decode(errors='replace').strip()
+            raise RuntimeError(f'psql exited {code}: {message}')
 
 
-def verify(database):
-    archive_digest = hashlib.sha256()
-    with ARCHIVE.open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            archive_digest.update(block)
-    actual_archive_digest = archive_digest.hexdigest()
-    if actual_archive_digest != ORIGINAL_SHA256:
-        raise ValueError('Original dataset archive checksum does not match SourceForge')
-
-    actual_catalog = {}
-    query = '''SELECT e.experiment_id, e.experiment_code, c.component_name,
-                      t.variable_name, t.trajectory_id
-               FROM public.trajectory t
-               JOIN public.experiment e USING (experiment_id)
-               JOIN public.component c USING (component_id)'''
-    for row in database_rows(database, query):
-        eid, code, component, variable, tid = row
+def database_catalog(database: str) -> dict[Key, tuple[int, int]]:
+    catalog: dict[Key, tuple[int, int]] = {}
+    for eid, code, component, variable, tid in copy_rows(database, CATALOG_QUERY):
         key = code, component, variable
-        if key in actual_catalog:
+        if key in catalog:
             raise ValueError(f'Duplicate database trajectory: {key!r}')
-        actual_catalog[key] = int(eid), int(tid)
-
-    expected_digest = hashlib.sha256()
-    expected_catalog = set()
-    observation_id = 0
-    trajectory_id = 0
-    blank_time_values = 0
-    with ZipFile(ARCHIVE) as archive:
-        members = [member for member in archive.namelist()
-                   if member.endswith('.csv')]
-        if len(members) != len(set(members)):
-            raise ValueError('Duplicate original CSV archive entries')
-        members.sort(key=lambda member: (
-            tuple(int(token) for token in member.split('/')[1].split('-')),
-            Path(member).stem,
-        ))
-        codes = sorted({member.split('/')[1] for member in members},
-                       key=lambda code: tuple(int(token) for token in code.split('-')))
-        experiment_ids = {code: index for index, code in enumerate(codes, 1)}
-
-        for member in members:
-            code = member.split('/')[1]
-            component = Path(member).stem
-            with archive.open(member) as binary:
-                rows = csv.reader(io.TextIOWrapper(binary, encoding='utf-8-sig',
-                                                   newline=''))
-                header = next(rows)
-                if header[0] != '' or len(header) != len(set(header)):
-                    raise ValueError(f'Invalid source header: {member}')
-                ids = []
-                for variable in header[1:]:
-                    trajectory_id += 1
-                    key = code, component, variable
-                    expected = experiment_ids[code], trajectory_id
-                    if actual_catalog.get(key) != expected:
-                        raise ValueError(f'Trajectory identity mismatch: {key!r}')
-                    expected_catalog.add(key)
-                    ids.append(trajectory_id)
-
-                for row_number, row in enumerate(rows, 2):
-                    if len(row) == 1:
-                        # The final timestamp has no observation values.
-                        canonical_time(row[0])
-                        continue
-                    if len(row) != len(header):
-                        raise ValueError(f'Invalid source CSV width: {member}:{row_number}')
-                    source_time = row[0].strip() or None
-                    if source_time is None and row_number != 2:
-                        raise ValueError(f'Unexpected blank source time: {member}:{row_number}')
-                    for tid, cell in zip(ids, row[1:]):
-                        value = cell.strip()
-                        if value == '':
-                            continue
-                        observation_id += 1
-                        if source_time is None:
-                            blank_time_values += 1
-                        digest_record(expected_digest, observation_id, tid,
-                                      source_time, value)
-
-    if set(actual_catalog) != expected_catalog:
-        raise ValueError('PostgreSQL trajectory inventory differs from the original CSV headers')
-
-    actual_digest = hashlib.sha256()
-    database_count = 0
-    query = '''SELECT observation_id, trajectory_id, logical_time, value
-               FROM public.observation ORDER BY observation_id'''
-    for row in database_rows(database, query):
-        oid, tid, time, value = row
-        database_count += 1
-        if int(oid) != database_count:
-            raise ValueError(f'Observation identity mismatch at row {database_count}')
-        digest_record(actual_digest, int(oid), int(tid), time or None, value)
-
-    source_hash = expected_digest.hexdigest()
-    database_hash = actual_digest.hexdigest()
-    matches = database_count == observation_id and source_hash == database_hash
-    result = {
-        'database': database,
-        'archive_sha256': actual_archive_digest,
-        'csv_files': len(members),
-        'experiments': len(codes),
-        'trajectories_checked': len(expected_catalog),
-        'source_observations': observation_id,
-        'database_observations': database_count,
-        'source_observations_without_time': blank_time_values,
-        'source_sha256': source_hash,
-        'database_sha256': database_hash,
-        'sha256_match': matches,
-    }
-    print(json.dumps(result, indent=2))
-    if not matches:
-        raise ValueError('Original source and PostgreSQL observation streams differ')
+        catalog[key] = int(eid), int(tid)
+    return catalog
 
 
-def main():
+def source_catalog(ds: Dataset) -> dict[Key, tuple[int, int]]:
+    return {(m.code, m.component, variable): (ds.exp_ids[m.code], tid)
+            for m in ds.members
+            for variable, tid in zip(m.variables, m.trajectory_ids)}
+
+
+def check_catalog(expected: dict[Key, tuple[int, int]],
+                  actual: dict[Key, tuple[int, int]]) -> None:
+    if expected == actual:
+        return
+    missing = expected.keys() - actual.keys()
+    extra = actual.keys() - expected.keys()
+    changed = [k for k in expected.keys() & actual.keys() if expected[k] != actual[k]]
+    sample = sorted(missing or extra or changed)[:3]
+    raise ValueError('PostgreSQL trajectory inventory differs from the original CSV '
+                     f'headers: {len(missing)} missing, {len(extra)} unexpected, '
+                     f'{len(changed)} with different IDs; e.g. {sample}')
+
+
+def database_observations(database: str) -> Iterator[Observation]:
+    for oid, tid, time, value in copy_rows(database, OBSERVATION_QUERY):
+        yield int(oid), int(tid), time, value  # NULL time arrives as ''
+
+
+def verify(database: str) -> None:
+    with open_dataset() as ds:
+        expected = source_catalog(ds)
+        check_catalog(expected, database_catalog(database))
+
+        source = summarize(canonical(ds.observations()))
+        actual = summarize(canonical(database_observations(database)))
+        matches = (source.count, source.sha256) == (actual.count, actual.sha256)
+        print(json.dumps({
+            'database': database,
+            'dataset_sha256': DATASET_SHA256,
+            'csv_files': len(ds.members),
+            'experiments': len(ds.codes),
+            'trajectories_checked': len(expected),
+            'source_observations': source.count,
+            'database_observations': actual.count,
+            'source_observations_without_time': source.blank_time,
+            'source_sha256': source.sha256,
+            'database_sha256': actual.sha256,
+            'sha256_match': matches,
+        }, indent=2))
+        if not matches:
+            detail = first_difference(canonical(ds.observations()),
+                                      canonical(database_observations(database)))
+            raise ValueError(f'Original source and PostgreSQL observation streams differ ({detail})')
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('database', nargs='?', default='cse412_team19')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         verify(args.database)
-    except (OSError, ValueError, RuntimeError, InvalidOperation) as error:
+    except (OSError, ValueError, RuntimeError, InvalidOperation, csv.Error) as error:
         print(f'Verification failed: {error}', file=sys.stderr)
         return 1
     return 0
